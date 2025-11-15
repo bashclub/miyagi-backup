@@ -255,7 +255,7 @@ run_remote_updates() {
     # PBS-Host-Update 
     if [[ "${BACKUPSERVER,,}" == "yes" ]]; then
       log "Running updates on PBS host ($PBSHOST)..."
-      ssh root@"$PBSHOST" apt update && ssh root@"$PBSHOST" apt dist-upgrade -y || {
+      ssh -p $PBSPORT root@"$PBSHOST" apt update && ssh -p $PBSPORT root@"$PBSHOST" apt dist-upgrade -y || {
         log "Error during updates on $PBSHOST"
       }
     else
@@ -371,10 +371,10 @@ run_maintenance() {
   
   if [[ "$(date +%u)" == "$MAINTDAY" ]]; then
     log "Running maintenance..."
-    PRUNEJOB=$(ssh "$PBSHOST" proxmox-backup-manager prune-job list --output-format json-pretty | grep -m 1 "id" | cut -d'"' -f4)
-    ssh root@"$PBSHOST" proxmox-backup-manager prune-job run "$PRUNEJOB"
-    ssh root@"$PBSHOST" proxmox-backup-manager garbage-collection start "$BACKUPSTOREPBS"
-    ssh root@"$PBSHOST" proxmox-backup-manager verify backup
+    PRUNEJOB=$(ssh -p $PBSPORT "$PBSHOST" proxmox-backup-manager prune-job list --output-format json-pretty | grep -m 1 "id" | cut -d'"' -f4)
+    ssh -p $PBSPORT root@"$PBSHOST" proxmox-backup-manager prune-job run "$PRUNEJOB"
+    ssh -p $PBSPORT root@"$PBSHOST" proxmox-backup-manager garbage-collection start "$BACKUPSTOREPBS"
+    ssh -p $PBSPORT root@"$PBSHOST" proxmox-backup-manager verify backup
   else
     log "No maintenance scheduled for today."
   fi
@@ -496,9 +496,8 @@ shutdown_now() {
     send_piggyback
     send_piggyback_external
     send_checkzfs_external
-    log "Shutting down now...in 60sec"
-    sleep 60
-    shutdown now
+    log "Shutting down now...in 1 min"
+    shutdown +1
   else
     log "No shutdown requested."
   fi
