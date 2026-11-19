@@ -40,6 +40,20 @@ if [[ -n "${CONFIG_FILE:-}" ]]; then
 
   source "$CONFIG_FILE"
 
+  : "${CHECKZFS_DISABLED:=0}"
+  : "${CHECKZFS_LOCAL:=0}"
+  : "${CHECKZFS_MAX_AGE:=1500,2000}"
+  : "${CHECKZFS_MAX_SNAPSHOT_COUNT:=180,200}"
+  : "${CHECKZFS_SPOOL:=1}"
+  : "${CHECKZFS_SPOOL_MAXAGE:=90000}"
+
+  : "${SPOOL_DIR:=/var/lib/check_mk_agent/spool}"
+  : "${SPOOL_PREFIX_PBS:=120000}"
+  : "${SPOOL_PREFIX_PIGGYBACK:=100000}"
+  : "${SPOOL_PREFIX_PIGGYBACK_EXTERNAL:=100000}"
+  : "${SPOOL_PREFIX_CHECKZFS_EXTERNAL:=120000}"
+  : "${SPOOL_CLEANUP_DAYS:=7}"
+
   REQUIRED_VARS=(
     SOURCEPORT BACKUPSERVER ZSYNC MAINTDAY SHUTDOWN UPDATES
     SOURCEHOST ZFSROOT ZFSSECOND ZFSTRGT ZPUSHTAG ZPUSHMINKEEP ZPUSHKEEP ZPUSHLABEL
@@ -165,19 +179,20 @@ write_zsync_config() {
     echo "snapshot_filter=\"$ZPUSHFILTER\""
     echo "min_keep=$ZPUSHMINKEEP"
     echo "zfs_auto_snapshot_keep=$ZPUSHKEEP"
-    echo "zfs_auto_snapshot_label=$ZPUSHLABEL"
-    echo "zfs_auto_snapshot_engine=internal"
-    echo "checkzfs_disabled=0"
-    echo "checkzfs_local=0"
+    echo "zfs_auto_snapshot_label=\"$ZPUSHLABEL\""
+    echo "zfs_auto_snapshot_engine=\"internal\""
+    echo "checkzfs_disabled=$CHECKZFS_DISABLED"
+    echo "checkzfs_local=$CHECKZFS_LOCAL"
     echo "checkzfs_prefix=miyagi-$SOURCEHOSTNAME-$(hostname)-$ZPUSHTAG"
-    echo "checkzfs_max_age=1500,2000"
-    echo "checkzfs_max_snapshot_count=180,200"
-    echo "checkzfs_spool=1"
-    echo "checkzfs_spool_maxage=90000"
+    echo "checkzfs_max_age=$CHECKZFS_MAX_AGE"
+    echo "checkzfs_max_snapshot_count=$CHECKZFS_MAX_SNAPSHOT_COUNT"
+    echo "checkzfs_spool=$CHECKZFS_SPOOL"
+    echo "checkzfs_spool_maxage=$CHECKZFS_SPOOL_MAXAGE"
   } > "$conf_file"
 }
 
 run_zsync() {
+  write_zsync_config
   if [[ "$ZSYNC" != "no" ]]; then
     /usr/bin/bashclub-zsync -c "/etc/bashclub/$SOURCEHOST.conf"
   else
@@ -255,7 +270,7 @@ run_remote_updates() {
     # PBS-Host-Update 
     if [[ "${BACKUPSERVER,,}" == "yes" ]]; then
       log "Running updates on PBS host ($PBSHOST)..."
-      ssh root@"$PBSHOST" apt update && ssh root@"$PBSHOST" apt dist-upgrade -y || {
+      ssh -p $PBSPORT root@"$PBSHOST" apt update && ssh -p $PBSPORT root@"$PBSHOST" apt dist-upgrade -y || {
         log "Error during updates on $PBSHOST"
       }
     else
@@ -270,7 +285,7 @@ run_remote_updates() {
 send_piggyback() {
   get_sourcehostname
   local combined_host="miyagi-${SOURCEHOSTNAME}-$(hostname)"
-  local filename="90000_${combined_host}"
+  local filename="${SPOOL_PREFIX_PIGGYBACK}_${combined_host}"
 
   log "Reminder: Add a host named ${combined_host} in CMK (without Agent, Piggyback enabled)!"
   log "Creating piggyback file: $filename"
@@ -281,14 +296,28 @@ send_piggyback() {
     echo "<<<<>>>>"
   } > "$filename"
 
-  if rscp "$filename" "$SOURCEHOST:/var/lib/check_mk_agent/spool/"; then
+  if rscp "$filename" "$SOURCEHOST:${SPOOL_DIR}/"; then
     log "Piggyback data successfully sent to $SOURCEHOST"
+    rssh root@"$SOURCEHOST" "find '${SPOOL_DIR}' -maxdepth 1 -name '*_${combined_host}' -not -name '$(basename "$filename")' -mtime +${SPOOL_CLEANUP_DAYS} -delete" \
+      || log "WARNUNG: Aufräumen alter Piggyback-Spool-Dateien auf $SOURCEHOST fehlgeschlagen"
   else
     log "ERROR: Failed to send piggyback data to $SOURCEHOST"
   fi
 
   rm -f "$filename"
 }
+
+run_pbs_log_clear() {
+    log "Running clear LOG on PBS host ($PBSHOST)..."
+
+    if ! ssh -p "$PBSPORT" root@"$PBSHOST" \
+        find /var/log/proxmox-backup/tasks/ -type f -mtime +60 -delete; then
+        log "Error clearing PBS LOG on $PBSHOST"
+    fi
+}
+
+vzdump_success=false
+pbs_enabled_by_script=false
 
 run_pbs_backup() {
   if [[ "${BACKUPSERVER,,}" != "yes" ]]; then
@@ -299,69 +328,153 @@ run_pbs_backup() {
   get_sourcehostname
   log "Starte PBS Backup auf Host: $SOURCEHOST"
 
-  # PBS-Storage prüfen und ggf. aktivieren
+  # ------------------------------------------------------------
+  # PBS-Storage prüfen und ggf. temporär aktivieren
+  # ------------------------------------------------------------
+  pbs_enabled_by_script=false
+
   log "Prüfe, ob PBS-Storage '$BACKUPSTORE' auf $SOURCEHOST aktiviert ist..."
-  if rssh root@"$SOURCEHOST" "pvesm status | grep -w '$BACKUPSTORE' | grep -q 'disabled'"; then
+
+  if rssh root@"$SOURCEHOST" \
+    "pvesm status | grep -w '$BACKUPSTORE' | grep -q 'disabled'"; then
+
     log "PBS-Storage '$BACKUPSTORE' ist deaktiviert – aktiviere temporär und warte 10 Sekunden..."
-    rssh root@"$SOURCEHOST" "pvesm set '$BACKUPSTORE' --disable 0 && sleep 10"
-    pbs_enabled_by_script=true
+
+    if rssh root@"$SOURCEHOST" \
+      "pvesm set '$BACKUPSTORE' --disable 0 && sleep 10"; then
+
+      pbs_enabled_by_script=true
+      log "PBS-Storage '$BACKUPSTORE' wurde erfolgreich aktiviert."
+    else
+      log "FEHLER: PBS-Storage '$BACKUPSTORE' konnte nicht aktiviert werden."
+      vzdump_success=false
+      return 1
+    fi
+
   else
     log "PBS-Storage '$BACKUPSTORE' ist bereits aktiviert."
-    pbs_enabled_by_script=false
   fi
 
-  vzdump_success=false
+  # ------------------------------------------------------------
+  # PBS Namespace setzen
+  # ------------------------------------------------------------
+  PBS_NS_ARG=()
 
-  # Versuch: vzdump mit Change Detection
-  ## Eintrag muss in /etc/vzdump.conf entries-max 100000000
+  if [[ -n "$PBS_NAMESPACE" && "${PBS_NAMESPACE,,}" != "none" ]]; then
+    PBS_NS_ARG=(--pbs-namespace "$PBS_NAMESPACE")
+    log "PBS Namespace aktiviert: $PBS_NAMESPACE"
+  else
+    log "PBS Namespace nicht gesetzt – Backup läuft im Standard-Datastore"
+  fi
+  # ------------------------------------------------------------
+  # Backup-Status zurücksetzen
+  # ------------------------------------------------------------
+  vzdump_success=false
+  # ------------------------------------------------------------
+  # vzdump mit Change Detection
+  # ------------------------------------------------------------
   log "Starte vzdump mit Change Detection..."
-  if rssh root@"$SOURCEHOST" vzdump --pbs-change-detection-mode metadata \
-    --node "$SOURCEHOSTNAME" --storage "$BACKUPSTORE" \
-    --exclude "$BACKUPEXCLUDE" --mode snapshot --all 1 \
+
+  if rssh root@"$SOURCEHOST" \
+    vzdump --pbs-change-detection-mode metadata \
+    "${PBS_NS_ARG[@]}" \
+    --node "$SOURCEHOSTNAME" \
+    --storage "$BACKUPSTORE" \
+    --exclude "$BACKUPEXCLUDE" \
+    --mode snapshot \
+    --all 1 \
     --notes-template '{{guestname}}'; then
 
     log "vzdump (Change Detection) erfolgreich."
     vzdump_success=true
+
   else
+
     log "vzdump (Change Detection) fehlgeschlagen – versuche Fallback ohne Change Detection..."
 
-    if rssh root@"$SOURCEHOST" vzdump \
-      --node "$SOURCEHOSTNAME" --storage "$BACKUPSTORE" \
-      --exclude "$BACKUPEXCLUDE" --mode snapshot --all 1 \
+    # ----------------------------------------------------------
+    # Fallback ohne Change Detection
+    # ----------------------------------------------------------
+    if rssh root@"$SOURCEHOST" \
+      vzdump \
+      "${PBS_NS_ARG[@]}" \
+      --node "$SOURCEHOSTNAME" \
+      --storage "$BACKUPSTORE" \
+      --exclude "$BACKUPEXCLUDE" \
+      --mode snapshot \
+      --all 1 \
       --notes-template '{{guestname}}'; then
 
       log "Fallback-vzdump erfolgreich."
       vzdump_success=true
+
     else
+
       log "FEHLER: vzdump fehlgeschlagen – auch im Fallback."
+      vzdump_success=false
+
+    fi
+  fi
+  # ------------------------------------------------------------
+  # PBS-Storage nach erfolgreichem Backup wieder deaktivieren
+  #
+  # WICHTIG:
+  # Nur deaktivieren, wenn dieses Script den Storage
+  # vorher selbst aktiviert hat.
+  # ------------------------------------------------------------
+  if [[ "$vzdump_success" == true && "$pbs_enabled_by_script" == true ]]; then
+
+    log "Deaktiviere temporär aktiviertes PBS-Storage '$BACKUPSTORE' auf $SOURCEHOST..."
+
+    if rssh root@"$SOURCEHOST" \
+      "pvesm set '$BACKUPSTORE' --disable 1"; then
+
+      log "PBS-Storage '$BACKUPSTORE' wurde wieder deaktiviert."
+
+    else
+
+      log "WARNUNG: PBS-Storage '$BACKUPSTORE' konnte nicht wieder deaktiviert werden."
+
     fi
   fi
 
-  # PBS-Storage ggf. wieder deaktivieren
-  if [[ "$vzdump_success" == true && "$pbs_enabled_by_script" == true ]]; then
-    log "Deaktiviere temporär aktiviertes PBS-Storage '$BACKUPSTORE' auf $SOURCEHOST..."
-    rssh root@"$SOURCEHOST" "pvesm set '$BACKUPSTORE' --disable 1"
-  fi
 
+  # ------------------------------------------------------------
   # Monitoring-Ausgabe
+  # ------------------------------------------------------------
   if [[ "$vzdump_success" == true ]]; then
     echo "0 DailyPBS - Daily Backup erfolgreich" > /tmp/cmk_tmp.out
   else
     echo "2 DailyPBS - Daily Backup FEHLGESCHLAGEN" > /tmp/cmk_tmp.out
   fi
 
+  local pbs_spool_file="${SPOOL_PREFIX_PBS}_checkpbs"
+
   {
     echo "<<<local>>>"
     cat /tmp/cmk_tmp.out
-  } > /tmp/90000_checkpbs
+  } > "/tmp/${pbs_spool_file}"
 
-  rscp /tmp/90000_checkpbs root@"$SOURCEHOST":/var/lib/check_mk_agent/spool \
-    || log "Fehler beim Übertragen des Monitoring-Outputs via SCP"
+  if rscp "/tmp/${pbs_spool_file}" root@"$SOURCEHOST":"${SPOOL_DIR}"; then
+    rssh root@"$SOURCEHOST" "find '${SPOOL_DIR}' -maxdepth 1 -name '*_checkpbs' -not -name '${pbs_spool_file}' -mtime +${SPOOL_CLEANUP_DAYS} -delete" \
+      || log "WARNUNG: Aufräumen alter PBS-Spool-Dateien auf $SOURCEHOST fehlgeschlagen"
+  else
+    log "Fehler beim Übertragen des Monitoring-Outputs via SCP"
+  fi
 
-  rm -f /tmp/cmk_tmp.out /tmp/90000_checkpbs
+  rm -f /tmp/cmk_tmp.out "/tmp/${pbs_spool_file}"
+
   #write_pbs_status
-}
 
+  # ------------------------------------------------------------
+  # Rückgabestatus
+  # ------------------------------------------------------------
+  if [[ "$vzdump_success" == true ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
 
 run_maintenance() {
   if [[ "${BACKUPSERVER,,}" != "yes" ]]; then
@@ -371,10 +484,10 @@ run_maintenance() {
   
   if [[ "$(date +%u)" == "$MAINTDAY" ]]; then
     log "Running maintenance..."
-    PRUNEJOB=$(ssh "$PBSHOST" proxmox-backup-manager prune-job list --output-format json-pretty | grep -m 1 "id" | cut -d'"' -f4)
-    ssh root@"$PBSHOST" proxmox-backup-manager prune-job run "$PRUNEJOB"
-    ssh root@"$PBSHOST" proxmox-backup-manager garbage-collection start "$BACKUPSTOREPBS"
-    ssh root@"$PBSHOST" proxmox-backup-manager verify backup
+    PRUNEJOB=$(ssh -p $PBSPORT "$PBSHOST" proxmox-backup-manager prune-job list --output-format json-pretty | grep -m 1 "id" | cut -d'"' -f4)
+    ssh -p $PBSPORT root@"$PBSHOST" proxmox-backup-manager prune-job run "$PRUNEJOB"
+    ssh -p $PBSPORT root@"$PBSHOST" proxmox-backup-manager garbage-collection start "$BACKUPSTOREPBS"
+    ssh -p $PBSPORT root@"$PBSHOST" proxmox-backup-manager verify backup
   else
     log "No maintenance scheduled for today."
   fi
@@ -405,7 +518,7 @@ run_scrub_stop() {
 }
 
 write_pbs_status() {
-  local spool_file="/var/lib/check_mk_agent/spool/90000_checkpbs_local"
+  local spool_file="${SPOOL_DIR}/${SPOOL_PREFIX_PBS}_checkpbs_local"
   local repo="$BACKUPSTOREPBS"
   local tmpfile
   tmpfile=$(mktemp)
@@ -509,11 +622,12 @@ send_piggyback_external() {
         log "Externer Piggyback-Export deaktiviert."
         return
     fi
+    write_zsync_config
     get_sourcehostname
     log "Ermittelter SOURCEHOSTNAME: $SOURCEHOSTNAME"
 
     local combined_host="miyagi-${SOURCEHOSTNAME}-$(hostname)"
-    local spool_file="90000_${combined_host}_external"
+    local spool_file="${SPOOL_PREFIX_PIGGYBACK_EXTERNAL}_${combined_host}_external"
     local temp_dir
     temp_dir=$(mktemp -d)
 
@@ -525,8 +639,10 @@ send_piggyback_external() {
         echo "<<<<>>>>"
     } > "$temp_dir/$spool_file"
 
-    if scp -P "$EPIGGYBACK_PORT" "$temp_dir/$spool_file" "$EPIGGYBACK_HOST:/var/lib/check_mk_agent/spool/"; then
+    if scp -P "$EPIGGYBACK_PORT" "$temp_dir/$spool_file" "$EPIGGYBACK_HOST:${SPOOL_DIR}/"; then
         log "Piggyback-Daten erfolgreich an $EPIGGYBACK_HOST gesendet: $spool_file"
+        ssh -p "$EPIGGYBACK_PORT" "$EPIGGYBACK_HOST" "find '${SPOOL_DIR}' -maxdepth 1 -name '*_${combined_host}_external' -not -name '${spool_file}' -mtime +${SPOOL_CLEANUP_DAYS} -delete" \
+            || log "WARNUNG: Aufräumen alter Piggyback-Spool-Dateien auf $EPIGGYBACK_HOST fehlgeschlagen"
     else
         log "Fehler beim Übertragen der Piggyback-Daten an $EPIGGYBACK_HOST"
         rm -rf "$temp_dir"
@@ -553,7 +669,7 @@ send_checkzfs_external() {
         log "Externer Check-ZFS deaktiviert (ECHECKZFS=$ECHECKZFS)"
         return
     fi
-
+    write_zsync_config
     get_sourcehostname  # Setzt SOURCEHOSTNAME, wenn nicht vorhanden
 
     local checkzfs_cmd="${checkzfs_cmd:-$(command -v checkzfs)}"
@@ -576,9 +692,9 @@ send_checkzfs_external() {
     filter="#${filter%|}"
     log "Generierter ZFS-Filter: $filter"
 
-    local combined="miyagi-${SOURCEHOSTNAME}-$(hostname)"
+    local combined="miyagi-${SOURCEHOSTNAME}-$(hostname)-${ZPUSHTAG}"
     local spoolfile="/tmp/${combined}_checkzfs_external"
-    local spooldest="90000_${combined}_checkzfs_external"
+    local spooldest="${SPOOL_PREFIX_CHECKZFS_EXTERNAL}_${combined}_checkzfs_external"
 
     log "Führe checkzfs aus..."
     {
@@ -593,8 +709,10 @@ send_checkzfs_external() {
             --output checkmk
     } > "$spoolfile"
 
-    if scp -P "$ECHECKZFS_PORT" "$spoolfile" root@"$ECHECKZFS_HOST":/var/lib/check_mk_agent/spool/"$spooldest"; then
+    if scp -P "$ECHECKZFS_PORT" "$spoolfile" root@"$ECHECKZFS_HOST":"${SPOOL_DIR}/${spooldest}"; then
         log "Spool-Datei erfolgreich übertragen an $ECHECKZFS_HOST:$spooldest"
+        ssh -p "$ECHECKZFS_PORT" root@"$ECHECKZFS_HOST" "find '${SPOOL_DIR}' -maxdepth 1 -name 'miyagi-${SOURCEHOSTNAME}-$(hostname)-*_checkzfs_external' -not -name '${spooldest}' -mtime +${SPOOL_CLEANUP_DAYS} -delete" \
+            || log "WARNUNG: Aufräumen alter checkzfs-Spool-Dateien auf $ECHECKZFS_HOST fehlgeschlagen"
     else
         log "Fehler beim Übertragen der Spool-Datei an $ECHECKZFS_HOST"
     fi
@@ -617,40 +735,61 @@ wait() {
     fi
 }
 set_dynamic_route() {
-    local ddns_hostname="$SOURCEHOST"
+    local target="$SOURCEHOST"
     local gateway="$DDNS_GATEWAY"
-    local dns_server="1.1.1.1"
+    local dns_server="$DDNS_SERVER"
+    local current_ip
 
-    if [[ -z "$ddns_hostname" || -z "$gateway" ]]; then
+    if [[ -z "$target" || -z "$gateway" ]]; then
         log "Fehler: SOURCEHOST oder DDNS_GATEWAY nicht gesetzt"
         return 1
     fi
 
-    log "Setze temporäre Route zu DNS-Server $dns_server via $gateway..."
-    if ! ip route | grep -q "^$dns_server"; then
-        ip route add "$dns_server" via "$gateway" \
-            && log "Route zu $dns_server via $gateway gesetzt" \
-            || log "Fehler beim Setzen der DNS-Route"
+    # Ist SOURCEHOST bereits eine IPv4- oder IPv6-Adresse?
+    if [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$target" == *:* ]]; then
+        current_ip="$target"
+        log "SOURCEHOST ist bereits eine IP-Adresse: $current_ip"
     else
-        log "Route zu $dns_server bereits vorhanden"
+        log "Setze temporäre Route zu DNS-Server $dns_server via $gateway..."
+
+        case "$(uname -s)" in
+            Linux)
+                ip route | grep -q "^$dns_server" || \
+                    ip route add "$dns_server" via "$gateway"
+                ;;
+            FreeBSD)
+                route -n get "$dns_server" >/dev/null 2>&1 || \
+                    route add -host "$dns_server" "$gateway"
+                ;;
+        esac
+
+        log "Löse IP von $target über DNS $dns_server..."
+        current_ip=$(dig +short @"$dns_server" "$target" | awk 'NF {print; exit}')
+
+        if [[ -z "$current_ip" ]]; then
+            log "Fehler: Konnte IP für $target nicht auflösen"
+            return 1
+        fi
     fi
 
-    log "Löse IP von $ddns_hostname über DNS $dns_server..."
-    CURRENT_IP=$(dig +short @"$dns_server" "$ddns_hostname")
+    log "Ermittelte IP: $current_ip – setze Route via $gateway..."
 
-    if [[ -z "$CURRENT_IP" ]]; then
-        log "Fehler: Konnte IP für $ddns_hostname nicht auflösen"
-        return 1
-    fi
+    case "$(uname -s)" in
+        Linux)
+            ip route | grep -q "^$current_ip" || \
+                ip route add "$current_ip" via "$gateway"
+            ;;
+        FreeBSD)
+            route -n get "$current_ip" >/dev/null 2>&1 || \
+                route add -host "$current_ip" "$gateway"
+            ;;
+        *)
+            log "Nicht unterstütztes Betriebssystem: $(uname -s)"
+            return 1
+            ;;
+    esac
 
-    log "Ermittelte IP: $CURRENT_IP – setze Route via $gateway..."
-    if ! ip route | grep -q "^$CURRENT_IP"; then
-        ip route add "$CURRENT_IP" via "$gateway" \
-            && log "Route erfolgreich gesetzt: $CURRENT_IP via $gateway" \
-            || log "Fehler beim Setzen der Route zu $CURRENT_IP"
-    else
-        log "Route zu $CURRENT_IP bereits vorhanden"
-    fi
+    log "Route erfolgreich gesetzt: $current_ip via $gateway"
 }
 # Main execution:
 if [[ $# -eq 0 ]]; then
@@ -670,8 +809,9 @@ if [[ $# -eq 0 ]]; then
     
     if [[ "${BACKUPSERVER,,}" == "yes" ]]; then
         log "BACKUPSERVER ist aktiviert, führe Backup aus..."
-        run_maintenance
         run_pbs_backup
+        run_maintenance
+        run_pbs_log_clear
     else
         log "BACKUPSERVER ist nicht aktiviert (BACKUPSERVER=$BACKUPSERVER), überspringe Backup."
     fi

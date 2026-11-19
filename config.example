@@ -2,8 +2,9 @@
 
 UPDATES='yes'                # Proxmox VE und PBS Updates nach dem Lauf
 SHUTDOWN='no'                # System nach Ausführung herunterfahren?
-DYNROUTE='yes'
-DDNS_GATEWAY='192.168.66.1' 
+DYNROUTE='no'                #Dynroute setzen?
+DDNS_GATEWAY='192.168.66.1' # Gateway 
+DDNS_SERVER='1.1.1.1'        # Externer DNS Server
 REBOOT='no'                  # Reboot nach Update?
 
 # Quelle (Proxmox VE System, das gesichert wird)
@@ -13,14 +14,14 @@ SOURCEHOST='192.168.50.200'  # IP des Quell-Proxmox-Servers
 # Replikation (ZFS)
 ZFSROOT='rpool/data'                       # Erstes Dataset vom Quellsystem
 ZFSSECOND='rpool-hdd/data'                # Optional zweites Dataset
-ZFSTRGT='rpool-ssd1/repl/pve200'          # Zielpfad für Replikation
+ZFSTRGT='rpool/repl/pve200'               # Zielpfad für Replikation
 
 # ZFS Zsync Replikation
 ZSYNC='yes'                                # ZSYNC aktivieren (ja/nein)
-ZPUSHTAG='bashclub:zsync-198-ssd'         # Benutzer-Tag für ZFS
+ZPUSHTAG='bashclub:zsync'         # Benutzer-Tag für ZFS
 ZPUSHMINKEEP='3'                          # Mindestens zu behaltende Snapshots
 ZPUSHKEEP='14'                            # Snapshots mit dem Tag, die behalten werden
-ZPUSHLABEL='zsync-rz'                     # Suffix für Snapshot-Autoengine
+ZPUSHLABEL='zsync'                     # Suffix für Snapshot-Autoengine
 ZPUSHFILTER='hourly|daily|weekly|monthly' # Weitere Filter (leer lassen oder Muster wie daily| weekly etc.)
 
 # Backup mit Proxmox Backup Server
@@ -30,7 +31,8 @@ PBSHOST='192.168.50.199'                  # IP des Proxmox Backup Servers
 PBSPORT='22' 
 BACKUPSTORE='backup'                      # Datastore auf Quell-Proxmox
 BACKUPSTOREPBS='backup'                   # Datastore auf PBS
-BACKUPEXCLUDE='10,3252,3253,3254'         # VM/CT-IDs, die vom Backup ausgeschlossen sind
+PBS_NAMESPACE='none'                      # Namespace auf PBS, setzen wenn verfügbar sonst none!
+BACKUPEXCLUDE='9999,99988'         # VM/CT-IDs, die vom Backup ausgeschlossen sind
 REPLEXCLUDE=$BACKUPEXCLUDE              # Diese auch von Replikation ausschließen
 
 # Zusätzliche Monitoring-Ziele 
